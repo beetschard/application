@@ -22,10 +22,9 @@ type (
 )
 
 type (
-	APIFunc[Args any]        func(Context[Args]) (API, error)
-	EntrypointFunc[Args any] func(Context[Args]) error
-	GoFunc[Args any]         func(Context[Args]) error
-	Context[Args any]        struct {
+	APIFunc[Args any] func(Context[Args]) (API, error)
+	GoFunc[Args any]  func(Context[Args]) error
+	Context[Args any] struct {
 		stored *storedContext[Args]
 		Args   struct {
 			Args    Args
@@ -45,20 +44,15 @@ type (
 func Run[Args any](opt ...Option[Args]) {
 	exit := 0
 	defer func() { os.Exit(exit) }()
+
 	ctx, cancel := newContext[Args]()
 	defer cancel()
 
-	defaultPrefix := []Option[Args]{
-		OptionApplicationTimeout[Args](DefaultApplicationTimeout),
-	}
-	defaultSuffix := []Option[Args]{}
-
-	ctx.applyOpts(append(append(defaultPrefix, opt...), defaultSuffix...)...)
+	ctx.applyOpts(getOptions[Args](opt))
 	ctx.parseArgs()
-	ctx.initRouter()
 
-	err := make(chan error)
-	done := make(chan error)
+	errs := make(chan error)
+	done := make(chan struct{})
 
 	var wg sync.WaitGroup
 	for _, fn := range ctx.stored.opts.goFuncs {
@@ -66,7 +60,7 @@ func Run[Args any](opt ...Option[Args]) {
 		go func(fn GoFunc[Args]) {
 			defer wg.Done()
 			if err := fn(*ctx); err != nil {
-
+				errs <- err
 			}
 		}(fn)
 	}
@@ -77,30 +71,49 @@ func Run[Args any](opt ...Option[Args]) {
 	}()
 
 	select {
-	case err := <-err:
+	case err := <-errs:
 		cancel()
-		slog.Error("application returned an error", "error", err)
 		slog.Info("waiting for all goroutines to exit")
-		c := (<-chan time.Time)(make(chan time.Time))
-		if ctx.stored.opts.timeout > 0 {
-			c = time.After(ctx.stored.opts.timeout)
-		}
-
-		select {
-		case <-done:
-			slog.Info("all goroutines finished, goodbye")
-		case <-c:
-			slog.Info("goroutines did not finish after timeout", "timeout", ctx.stored.opts.timeout)
-		}
+		appWaitTimeoutErr(done, errs, err, ctx.stored.opts.timeout)
 		exit = 1
 	case <-done:
 		slog.Info("all goroutines finished, goodbye")
 	}
 }
 
+func appWaitTimeoutErr(done <-chan struct{}, errs <-chan error, err error, timeout time.Duration) {
+	c := (<-chan time.Time)(make(chan time.Time))
+	if timeout > 0 {
+		c = time.After(timeout)
+	}
+
+	for {
+		slog.Error("application returned an error", "error", err)
+
+		select {
+		case <-done:
+			slog.Info("all goroutines finished, goodbye")
+			return
+		case <-c:
+			slog.Info("goroutines did not finish after timeout", "timeout", timeout)
+			return
+		case err = <-errs:
+		}
+	}
+}
+
+func getOptions[Args any](opt []Option[Args]) []Option[Args] {
+	defaultPrefix := []Option[Args]{
+		OptionApplicationTimeout[Args](DefaultApplicationTimeout),
+	}
+	defaultSuffix := []Option[Args]{
+		OptionGoFunc[Args](runRouter[Args]),
+	}
+	return append(append(defaultPrefix, opt...), defaultSuffix...)
+}
+
 func newContext[Args any]() (*Context[Args], context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	return &Context[Args]{
 		stored: &storedContext[Args]{
 			context: ctx,
@@ -109,7 +122,7 @@ func newContext[Args any]() (*Context[Args], context.CancelFunc) {
 	}, cancel
 }
 
-func (ctx *Context[Args]) applyOpts(opt ...Option[Args]) {
+func (ctx *Context[Args]) applyOpts(opt []Option[Args]) {
 	for _, opt := range opt {
 		opt(&ctx.stored.opts)
 	}
@@ -128,14 +141,14 @@ func (ctx *Context[Args]) parseArgs() {
 	}
 }
 
-func (ctx *Context[Args]) initRouter() {
+func runRouter[Args any](ctx Context[Args]) error {
 	if len(ctx.stored.opts.apis) == 0 {
-		return
+		return nil
 	}
 
 	r := router.New()
 	for _, api := range ctx.stored.opts.apis {
-		api, err := api(*ctx)
+		api, err := api(ctx)
 		if err != nil {
 			slog.Error("failed to initialize api", "error", err)
 			os.Exit(1)
@@ -143,11 +156,7 @@ func (ctx *Context[Args]) initRouter() {
 		r.AddAPI(api)
 	}
 
-	go func() {
-		defer ctx.stored.cancel()
-		err := r.ServeHTTP(ctx, ctx.Args.Network, ctx.Args.Address)
-		slog.Error("http server stopped", "error", err)
-	}()
+	return r.ServeHTTP(&ctx, ctx.Args.Network, ctx.Args.Address)
 }
 
 func (ctx *Context[Args]) Deadline() (deadline time.Time, ok bool) {
